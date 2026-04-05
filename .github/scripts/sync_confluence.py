@@ -108,8 +108,6 @@ def main():
     # Discover local Markdown files and prepare their content for Confluence
     if not os.path.exists(DOCS_FOLDER):
         print(f"Warning: '{DOCS_FOLDER}' directory not found. No Markdown files to process.")
-        # If docs folder is missing, we might only need to handle deletions from Confluence.
-        # But if there are no local files, then all existing Confluence pages might be marked for deletion.
     else:
         for root, _, files in os.walk(DOCS_FOLDER):
             for filename in files:
@@ -121,13 +119,12 @@ def main():
                     page_title = generate_page_title(filepath)
                     
                     # Convert Markdown to HTML for Confluence storage format
-                    # The 'markdown' library does a good job, and Confluence typically handles basic HTML.
-                    # A wrapper div can sometimes help Confluence render it better.
                     html_content = markdown.markdown(md_content)
                     storage_format = f'<div class="markdown-body">{html_content}</div>'
                     
                     local_md_files[page_title] = {
                         'filepath': filepath,
+                        'title': page_title, # <--- ADD THIS LINE
                         'storage_format': storage_format,
                         'storage_hash': get_content_hash(storage_format)
                     }
