@@ -1,1 +1,1 @@
-This is a simple guide for getting started 4
+This is a simple guide for getting started after SHA pinning
