@@ -59,7 +59,7 @@ def get_all_confluence_pages_under_parent(parent_page_id):
     try:
         # Corrected method: confluence.get_child_pages
         # This method directly returns a list of page dictionaries.
-        children_list = confluence.get_child_pages(parent_page_id, limit=200) 
+        children_list = confluence.get_child_pages(parent_page_id) 
         
         for page in children_list: # children_list now directly contains the page dictionaries
             page_id = page['id']
