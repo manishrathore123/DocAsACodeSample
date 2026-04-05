@@ -57,18 +57,11 @@ def get_all_confluence_pages_under_parent(parent_page_id):
     all_pages = {}
     
     try:
-        # Fetching direct children first
-        children_response = confluence.get_page_child_by_id(parent_page_id, limit=200) # Max limit for direct children
+        # Corrected method: confluence.get_child_pages
+        # This method directly returns a list of page dictionaries.
+        children_list = confluence.get_child_pages(parent_page_id, limit=200) 
         
-        children_list = []
-        if children_response and 'results' in children_response:
-            children_list = children_response['results']
-        
-        # Recursively fetch children of children to get the full hierarchy if needed
-        # For simplicity, this script currently only looks at direct children of the parent.
-        # If you have a deeper hierarchy in Confluence, you'd need a more complex recursive fetch.
-        
-        for page in children_list:
+        for page in children_list: # children_list now directly contains the page dictionaries
             page_id = page['id']
             page_title = page['title']
             
@@ -187,7 +180,6 @@ def main():
             print(f"Error creating Confluence page '{page_data['title']}': {e}")
             # Do not exit here to allow other operations to proceed, but log the error
             # For a critical system, you might want to uncomment sys.exit(1)
-            # sys.exit(1) 
 
     # 2. Update existing pages
     for page_data in pages_to_update:
@@ -209,7 +201,7 @@ def main():
             print(f"Error updating Confluence page '{page_data['title']}' (ID: {page_data['id']}): {e}")
             # sys.exit(1)
 
-    # 3. Delete pages
+    # 3. Delete pages (THIS IS THE PART THAT WAS MISSING/CUT OFF)
     for page_data in pages_to_delete:
         print(f"Deleting Confluence page: '{page_data['title']}' (ID: {page_data['id']}) because no corresponding local Markdown file was found.")
         try:
