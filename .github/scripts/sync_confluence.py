@@ -1,219 +1,279 @@
 import os
 import sys
 import hashlib
-import json
 from atlassian import Confluence
-import markdown # For converting Markdown to HTML
+import markdown
 
-# --- Configuration ---
-# These variables will be loaded from GitHub Secrets (environment variables)
+# --- Configuration from environment ---
 CONFLUENCE_URL = os.environ.get('CONFLUENCE_URL')
-CONFLUENCE_USERNAME = os.environ.get('CONFLUENCE_USERNAME') # For Confluence Cloud, this is your email
+CONFLUENCE_USERNAME = os.environ.get('CONFLUENCE_USERNAME')
 CONFLUENCE_API_TOKEN = os.environ.get('CONFLUENCE_API_TOKEN')
 CONFLUENCE_SPACE_KEY = os.environ.get('CONFLUENCE_SPACE_KEY')
 CONFLUENCE_PARENT_PAGE_ID = os.environ.get('CONFLUENCE_PARENT_PAGE_ID')
 
-DOCS_FOLDER = 'docs' # The folder in your Git repo containing Markdown files
+DOCS_FOLDER = 'docs'  # root folder in repo
 
-# --- Initialize Confluence API client ---
-# For Confluence Cloud, set cloud=True and use username (email) and API token.
-# For Confluence Server, set cloud=False and use username and password.
-# The 'password' parameter is used for the API token for Cloud.
+# --- Confluence client ---
 confluence = Confluence(
     url=CONFLUENCE_URL,
     username=CONFLUENCE_USERNAME,
     password=CONFLUENCE_API_TOKEN,
-    cloud=True # Set to False for Confluence Server, True for Confluence Cloud
+    cloud=True
 )
 
-def generate_page_title(filepath):
-    """Generates a Confluence page title from a Markdown file path."""
-    # Example: docs/my-folder/my-page.md -> My Page
-    # If it's index.md, use the parent folder name or a default "Documentation Home"
-    
-    relative_path = os.path.relpath(filepath, DOCS_FOLDER)
-    parts = relative_path.split(os.sep)
-    
-    if parts[-1].lower() == "index.md":
-        # If it's an index.md, try to use the parent folder name
-        if len(parts) > 1:
-            title = parts[-2]
-        else: # It's docs/index.md, directly in the root of the docs folder
-            title = "Documentation Home" # A default title for the main index
-    else:
-        # For other files, use the filename without extension
-        title = os.path.splitext(parts[-1])[0]
+# ---------- Helpers ----------
 
-    # Clean up and title-case the title
-    return title.replace('-', ' ').replace('_', ' ').title()
-
-def get_content_hash(content):
-    """Generates an MD5 hash of the content to detect changes."""
+def md5(content: str) -> str:
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
-def get_all_confluence_pages_under_parent(parent_page_id):
-    """Fetches all child pages under a given parent page and their content hash."""
-    print(f"Fetching existing Confluence pages under parent ID: {parent_page_id}")
-    all_pages = {}
-    
-    try:
-        # Corrected method: confluence.get_child_pages
-        # This method directly returns a list of page dictionaries.
-        children_list = confluence.get_child_pages(parent_page_id) 
-        
-        for page in children_list: # children_list now directly contains the page dictionaries
-            page_id = page['id']
-            page_title = page['title']
-            
-            # Fetch the actual content of each child page to get its storage format
-            # This is a network call for each page, can be slow for many pages.
-            page_content_detail = confluence.get_page_by_id(page_id, expand='body.storage')
-            
-            storage_hash = None
-            if page_content_detail and 'body' in page_content_detail and 'storage' in page_content_detail['body']:
-                storage_format_content = page_content_detail['body']['storage']['value']
-                storage_hash = get_content_hash(storage_format_content)
-            else:
-                print(f"Warning: Could not retrieve storage content for Confluence page '{page_title}' ({page_id}). Hash will be null.")
+def to_title(name: str) -> str:
+    """Convert folder/file name to human title."""
+    return (
+        name.replace('-', ' ')
+            .replace('_', ' ')
+            .strip()
+            .title()
+    )
 
-            all_pages[page_title] = {
-                'id': page_id,
-                'hash': storage_hash,
-                'title': page_title
+def get_or_create_page(title: str, parent_id: str):
+    """
+    Get a page by title under a specific parent. If it doesn't exist, create it.
+    Return page dict {id, title, hash}.
+    """
+    # Search children of parent by title
+    children = confluence.get_child_pages(parent_id)
+    for c in children:
+        if c['title'] == title:
+            # fetch content to compute hash
+            detail = confluence.get_page_by_id(c['id'], expand='body.storage')
+            storage = detail.get('body', {}).get('storage', {}).get('value', '')
+            return {
+                'id': c['id'],
+                'title': c['title'],
+                'hash': md5(storage)
             }
-        print(f"Found {len(all_pages)} child pages in Confluence under parent ID {parent_page_id}.")
-    except Exception as e:
-        print(f"Error fetching Confluence pages under parent ID {parent_page_id}: {e}")
-        # In a GA, it's often better to exit on critical errors like this.
-        sys.exit(1) 
 
-    return all_pages
+    # doesn't exist: create empty page
+    print(f"Creating folder/parent page '{title}' under parent {parent_id}")
+    created = confluence.create_page(
+        space=CONFLUENCE_SPACE_KEY,
+        parent_id=parent_id,
+        title=title,
+        body='',  # empty for now
+        representation='storage'
+    )
+    return {
+        'id': created['id'],
+        'title': created['title'],
+        'hash': md5('')
+    }
+
+def get_existing_tree(root_parent_id: str):
+    """
+    Build a map of all existing pages under the root parent, by (path_key -> page_info).
+    path_key is a string like 'docs', 'docs/guide', 'docs/guide/part-1'.
+    """
+    tree = {}
+
+    def walk(parent_id: str, current_path: str):
+        children = confluence.get_child_pages(parent_id)
+        for c in children:
+            title = c['title']
+            # path_key is purely conceptual; we use titles joined with '/'
+            path_key = f"{current_path}/{title}" if current_path else title
+
+            detail = confluence.get_page_by_id(c['id'], expand='body.storage')
+            storage = detail.get('body', {}).get('storage', {}).get('value', '')
+            page_hash = md5(storage)
+
+            tree[path_key] = {
+                'id': c['id'],
+                'title': title,
+                'hash': page_hash,
+                'parent_path': current_path,
+                'parent_id': parent_id
+            }
+
+            # recurse
+            walk(c['id'], path_key)
+
+    # root path is like 'docs-root'
+    root_path_key = 'ROOT'
+    walk(root_parent_id, root_path_key)
+    return tree
+
+# ---------- Main ----------
 
 def main():
-    # Check if all required environment variables are set
-    if not all([CONFLUENCE_URL, CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACE_KEY, CONFLUENCE_PARENT_PAGE_ID]):
-        print("Error: Missing one or more Confluence environment variables.")
-        print("Please ensure CONFLUENCE_URL, CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACE_KEY, and CONFLUENCE_PARENT_PAGE_ID are set as GitHub Secrets.")
+    # sanity check
+    if not all([CONFLUENCE_URL, CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN,
+                CONFLUENCE_SPACE_KEY, CONFLUENCE_PARENT_PAGE_ID]):
+        print("Missing one or more Confluence env vars.")
         sys.exit(1)
 
-    print(f"Attempting to sync Markdown files from '{DOCS_FOLDER}' to Confluence space '{CONFLUENCE_SPACE_KEY}' under parent page ID '{CONFLUENCE_PARENT_PAGE_ID}'")
+    print(f"Syncing '{DOCS_FOLDER}' into Confluence space '{CONFLUENCE_SPACE_KEY}' "
+          f"under parent page ID '{CONFLUENCE_PARENT_PAGE_ID}'")
 
-    # Get existing pages in Confluence under the parent
-    existing_confluence_pages = get_all_confluence_pages_under_parent(CONFLUENCE_PARENT_PAGE_ID)
-    
-    local_md_files = {}
-    pages_to_create = []
-    pages_to_update = []
-    
-    # Discover local Markdown files and prepare their content for Confluence
+    # 1. Get existing tree from Confluence
+    existing_tree = get_existing_tree(CONFLUENCE_PARENT_PAGE_ID)
+
+    # We'll key local paths as "ROOT/docs[/subdir]/Title"
+    local_pages = {}  # path_key -> {title, storage, hash, parent_path}
+
+    # 2. Walk docs/ and compute titles + parents
     if not os.path.exists(DOCS_FOLDER):
-        print(f"Warning: '{DOCS_FOLDER}' directory not found. No Markdown files to process.")
+        print(f"Warning: '{DOCS_FOLDER}' not found.")
     else:
-        for root, _, files in os.walk(DOCS_FOLDER):
-            for filename in files:
-                if filename.endswith('.md'):
-                    filepath = os.path.join(root, filename)
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        md_content = f.read()
-                    
-                    page_title = generate_page_title(filepath)
-                    
-                    # Convert Markdown to HTML for Confluence storage format
-                    html_content = markdown.markdown(md_content)
-                    storage_format = f'<div class="markdown-body">{html_content}</div>'
-                    
-                    local_md_files[page_title] = {
-                        'filepath': filepath,
-                        'title': page_title, # <--- ADD THIS LINE
-                        'storage_format': storage_format,
-                        'storage_hash': get_content_hash(storage_format)
+        for root, dirs, files in os.walk(DOCS_FOLDER):
+            # relative folder from docs
+            rel_dir = os.path.relpath(root, DOCS_FOLDER)  # '.' or 'guide' or 'guide/sub'
+            # Build folder path as titles
+            if rel_dir == '.':
+                folder_parts = []  # docs root itself
+            else:
+                folder_parts = rel_dir.split(os.sep)
+
+            # Parent path key in Confluence terms (titles joined with '/')
+            # Root parent in Confluence mapping is 'ROOT'
+            parent_path_key = 'ROOT'
+            parent_id = CONFLUENCE_PARENT_PAGE_ID
+
+            # Ensure folder pages (for each level)
+            for part in folder_parts:
+                folder_title = to_title(part)
+                folder_path_key = f"{parent_path_key}/{folder_title}"
+
+                if folder_path_key in existing_tree:
+                    # reuse existing
+                    parent_id = existing_tree[folder_path_key]['id']
+                else:
+                    # create folder page
+                    page_info = get_or_create_page(folder_title, parent_id)
+                    parent_id = page_info['id']
+                    # add to existing_tree in-memory
+                    existing_tree[folder_path_key] = {
+                        'id': page_info['id'],
+                        'title': page_info['title'],
+                        'hash': page_info['hash'],
+                        'parent_path': parent_path_key,
+                        'parent_id': parent_id
                     }
 
-    # --- Determine Actions (Create/Update/Delete) ---
+                parent_path_key = folder_path_key
 
-    # Pages to Create or Update
-    for title, local_page_data in local_md_files.items():
-        if title not in existing_confluence_pages:
-            pages_to_create.append(local_page_data)
+            # Now parent_path_key/parent_id represent this folder in Confluence
+            # 2a. Handle files in this folder
+            for filename in files:
+                if not filename.endswith('.md'):
+                    continue
+                filepath = os.path.join(root, filename)
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    md_content = f.read()
+
+                name_no_ext = os.path.splitext(filename)[0]
+                if name_no_ext.lower() == 'index':
+                    # index.md -> represents the folder page itself
+                    page_title = to_title(folder_parts[-1]) if folder_parts else "Documentation Home"
+                    page_path_key = f"{parent_path_key}/{page_title}"
+                    is_folder_index = True
+                else:
+                    page_title = to_title(name_no_ext)
+                    page_path_key = f"{parent_path_key}/{page_title}"
+                    is_folder_index = False
+
+                html_content = markdown.markdown(md_content)
+                storage = f'<div class="markdown-body">{html_content}</div>'
+                storage_hash = md5(storage)
+
+                local_pages[page_path_key] = {
+                    'title': page_title,
+                    'storage': storage,
+                    'hash': storage_hash,
+                    'parent_path': parent_path_key,
+                    'parent_id': parent_id,
+                    'filepath': filepath,
+                    'is_folder_index': is_folder_index
+                }
+
+    # 3. Decide creates/updates/deletes
+
+    pages_to_create = []
+    pages_to_update = []
+    # Map path_key -> existing page for easier lookups
+    # existing_tree keys look like 'ROOT/Docs/Guide/Part 1' and local_pages keys the same pattern.
+    for path_key, local in local_pages.items():
+        if path_key not in existing_tree:
+            pages_to_create.append(local)
         else:
-            confluence_page_id = existing_confluence_pages[title]['id']
-            confluence_page_hash = existing_confluence_pages[title]['hash']
-            
-            # Compare hashes of the Confluence storage format (local MD converted to storage format)
-            # with the actual Confluence page's storage format.
-            if local_page_data['storage_hash'] != confluence_page_hash:
+            remote = existing_tree[path_key]
+            if local['hash'] != remote['hash']:
                 pages_to_update.append({
-                    'id': confluence_page_id,
-                    'title': title,
-                    **local_page_data # Include all local data
+                    'id': remote['id'],
+                    'title': local['title'],
+                    'storage': local['storage'],
+                    'filepath': local['filepath'],
+                    'parent_id': remote['parent_id'],
+                    'path_key': path_key
                 })
             else:
-                print(f"Confluence page '{title}' is up to date (hash match). Skipping update.")
+                print(f"Up to date: {path_key}")
 
-    # Pages to Delete (exist in Confluence but not in local files)
+    # Deletions: existing pages under ROOT that have no local counterpart
     pages_to_delete = []
-    for title, page_info in existing_confluence_pages.items():
-        if title not in local_md_files:
-            pages_to_delete.append({
-                'id': page_info['id'],
-                'title': title
-            })
+    for path_key, remote in existing_tree.items():
+        if path_key == 'ROOT':
+            continue
+        if path_key not in local_pages:
+            # Only delete leaf pages: if any page has this as parent_path, skip delete
+            is_parent = any(
+                rp['parent_path'] == path_key
+                for rp in existing_tree.values()
+            )
+            if not is_parent:
+                pages_to_delete.append(remote)
 
-    # --- Execute Actions ---
+    # 4. Apply changes
 
-    # 1. Create new pages
-    for page_data in pages_to_create:
-        print(f"Creating new Confluence page: '{page_data['title']}' from '{page_data['filepath']}'")
+    # Creates
+    for p in pages_to_create:
+        print(f"Creating page '{p['title']}' under parent {p['parent_id']} from {p['filepath']}")
         try:
             confluence.create_page(
                 space=CONFLUENCE_SPACE_KEY,
-                parent_id=CONFLUENCE_PARENT_PAGE_ID,
-                title=page_data['title'],
-                body=page_data['storage_format'],
+                parent_id=p['parent_id'],
+                title=p['title'],
+                body=p['storage'],
                 representation='storage'
             )
-            print(f"Successfully created '{page_data['title']}'.")
         except Exception as e:
-            print(f"Error creating Confluence page '{page_data['title']}': {e}")
-            # Do not exit here to allow other operations to proceed, but log the error
-            # For a critical system, you might want to uncomment sys.exit(1)
+            print(f"Error creating page '{p['title']}': {e}")
 
-    # 2. Update existing pages
-    for page_data in pages_to_update:
-        print(f"Updating Confluence page: '{page_data['title']}' (ID: {page_data['id']}) from '{page_data['filepath']}'")
+    # Updates
+    for p in pages_to_update:
+        print(f"Updating page '{p['title']}' (ID {p['id']}) from {p['filepath']}")
         try:
-            # Need to get current version to update a page
-            current_page_info = confluence.get_page_by_id(page_data['id'], expand='version')
-            current_version = current_page_info['version']['number'] if 'version' in current_page_info else 1
-
+            # need current version
+            detail = confluence.get_page_by_id(p['id'], expand='version')
+            current_ver = detail.get('version', {}).get('number', 1)
             confluence.update_page(
-                page_id=page_data['id'],
-                title=page_data['title'],
-                body=page_data['storage_format'],
+                page_id=p['id'],
+                title=p['title'],
+                body=p['storage'],
                 representation='storage',
-                version=current_version + 1 # Increment version number for the update
+                version=current_ver + 1
             )
-            print(f"Successfully updated '{page_data['title']}'.")
         except Exception as e:
-            print(f"Error updating Confluence page '{page_data['title']}' (ID: {page_data['id']}): {e}")
-            # sys.exit(1)
+            print(f"Error updating page '{p['title']}': {e}")
 
-    # 3. Delete pages (THIS IS THE PART THAT WAS MISSING/CUT OFF)
-    for page_data in pages_to_delete:
-        print(f"Deleting Confluence page: '{page_data['title']}' (ID: {page_data['id']}) because no corresponding local Markdown file was found.")
+    # Deletes
+    for p in pages_to_delete:
+        print(f"Deleting page '{p['title']}' (ID {p['id']}) – no local markdown found")
         try:
-            # Important: recursive=False to only delete the specified page, not its children.
-            # If you want to delete children too, set recursive=True, but be very careful as this is destructive!
-            confluence.remove_page(page_id=page_data['id'], recursive=False)
-            print(f"Successfully deleted '{page_data['title']}'.")
+            confluence.remove_page(page_id=p['id'], recursive=False)
         except Exception as e:
-            print(f"Error deleting Confluence page '{page_data['title']}' (ID: {page_data['id']}): {e}")
-            # Do not exit here, as deletion failures for one page shouldn't stop others
+            print(f"Error deleting page '{p['title']}': {e}")
 
-    if not pages_to_create and not pages_to_update and not pages_to_delete:
-        print("No changes detected in Markdown files. Confluence pages are in sync.")
-    else:
-        print("Confluence synchronization process completed.")
+    print("Sync complete.")
 
 if __name__ == "__main__":
     main()
