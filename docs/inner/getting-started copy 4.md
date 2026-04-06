@@ -1,1 +1,1 @@
-This is a simple guide for getting started after SHA pinning
+This is a simple guide for getting started after archive Logic
