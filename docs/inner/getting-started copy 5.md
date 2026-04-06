@@ -1,1 +1,0 @@
-This is a simple guide for getting started after archive logic
