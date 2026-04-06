@@ -1,1 +1,1 @@
-This is a simple guide for getting started with conf documentation
+This is a simple guide for getting started
