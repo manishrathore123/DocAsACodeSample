@@ -10,7 +10,6 @@ CONFLUENCE_USERNAME = os.environ.get('CONFLUENCE_USERNAME')
 CONFLUENCE_API_TOKEN = os.environ.get('CONFLUENCE_API_TOKEN')
 CONFLUENCE_SPACE_KEY = os.environ.get('CONFLUENCE_SPACE_KEY')
 CONFLUENCE_PARENT_PAGE_ID = os.environ.get('CONFLUENCE_PARENT_PAGE_ID')
-CONFLUENCE_ARCHIVE_PARENT_PAGE_ID = os.environ.get('CONFLUENCE_ARCHIVE_PARENT_PAGE_ID')
 
 DOCS_FOLDER = "docs"
 
@@ -22,16 +21,23 @@ confluence = Confluence(
 )
 
 def md5(text: str) -> str:
+    """Generates an MD5 hash of the content for change detection."""
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 def to_title(name: str) -> str:
+    """Converts a file/folder name into a Confluence-friendly title."""
     return name.replace("-", " ").replace("_", " ").strip().title()
 
 def markdown_to_storage(md_content: str) -> str:
+    """Converts Markdown content to Confluence storage format (HTML)."""
     html = markdown.markdown(md_content)
     return f'<div class="markdown-body">{html}</div>'
 
 def find_page_in_space_by_title(title: str):
+    """
+    Finds a page in the Confluence space by its title.
+    Returns the page details if found, else None.
+    """
     try:
         page = confluence.get_page_by_title(
             space=CONFLUENCE_SPACE_KEY,
@@ -43,6 +49,12 @@ def find_page_in_space_by_title(title: str):
         return None
 
 def ensure_folder_page(folder_title: str, parent_id: str) -> str:
+    """
+    Ensures a Confluence page exists with the given folder_title under parent_id.
+    If a page with folder_title already exists in the space, it moves it under parent_id
+    if its parent is different. If it does not exist, a new page is created.
+    Returns the ID of the existing or newly created folder page.
+    """
     existing = find_page_in_space_by_title(folder_title)
     if existing:
         page_id = existing['id']
@@ -50,149 +62,250 @@ def ensure_folder_page(folder_title: str, parent_id: str) -> str:
         if str(current_parent_id) != str(parent_id):
             print(f"Moving existing folder page '{folder_title}' (ID {page_id}) to be under parent {parent_id}.")
             body_content = existing.get('body', {}).get('storage', {}).get('value', '')
-            # This call might need a version number depending on the atlassian-python-api version
-            try:
-                confluence.update_page(
-                    page_id=page_id, title=folder_title, body=body_content, parent_id=parent_id
-                )
-            except TypeError:
-                 # Fallback for older versions that require version
-                 confluence.update_page(
-                    page_id=page_id, title=folder_title, body=body_content, parent_id=parent_id, version=existing['version']['number'] + 1
-                )
+            confluence.update_page(
+                page_id=page_id,
+                title=folder_title,
+                body=body_content,
+                parent_id=parent_id,
+            )
         return page_id
 
     print(f"Creating new folder page '{folder_title}' under parent {parent_id}.")
     created = confluence.create_page(
-        space=CONFLUENCE_SPACE_KEY, parent_id=parent_id, title=folder_title, body="", representation="storage"
+        space=CONFLUENCE_SPACE_KEY,
+        parent_id=parent_id,
+        title=folder_title,
+        body="",
+        representation="storage",
     )
     return created["id"]
 
 def main():
+    # --- 1. Initial Checks ---
     if not all([
-        CONFLUENCE_URL, CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACE_KEY, CONFLUENCE_PARENT_PAGE_ID
+        CONFLUENCE_URL,
+        CONFLUENCE_USERNAME,
+        CONFLUENCE_API_TOKEN,
+        CONFLUENCE_SPACE_KEY,
+        CONFLUENCE_PARENT_PAGE_ID,
     ]):
-        print("Error: Missing required Confluence env vars."); sys.exit(1)
+        print("Error: Missing required Confluence environment variables.")
+        sys.exit(1)
 
-    print(f"Starting sync...")
-    if CONFLUENCE_ARCHIVE_PARENT_PAGE_ID:
-        print(f"Archiving is enabled.")
-        try: confluence.get_page_by_id(CONFLUENCE_ARCHIVE_PARENT_PAGE_ID)
-        except Exception: print(f"Error: Archive parent page ID '{CONFLUENCE_ARCHIVE_PARENT_PAGE_ID}' not found."); sys.exit(1)
-    else:
-        print(f"Archiving is disabled. Pages will be deleted.")
+    print(
+        f"Starting sync: Markdown files from '{DOCS_FOLDER}' to Confluence space '{CONFLUENCE_SPACE_KEY}' "
+        f"under parent page ID '{CONFLUENCE_PARENT_PAGE_ID}'."
+    )
 
-    # Logic to build folder hierarchy, discover local files, and fetch remote pages...
-    # (This part is assumed correct for this debugging step)
+    # --- 2. Build Confluence Folder Hierarchy based on Git Repo ---
     folder_parent_ids = {"": CONFLUENCE_PARENT_PAGE_ID}
+
     if os.path.isdir(DOCS_FOLDER):
         for root, dirs, files in os.walk(DOCS_FOLDER):
             rel = os.path.relpath(root, DOCS_FOLDER)
             folder_path = "" if rel == "." else rel.replace("\\", "/")
-            parent_id = folder_parent_ids[folder_path]
-            for d in dirs:
-                sub_path = os.path.join(folder_path, d).replace("\\", "/")
-                if sub_path in folder_parent_ids: continue
-                folder_page_id = ensure_folder_page(to_title(d), parent_id)
-                folder_parent_ids[sub_path] = folder_page_id
+            current_confluence_parent_id = folder_parent_ids[folder_path]
 
-    local_pages = {}
+            for d in dirs:
+                sub_folder_relative_path = os.path.join(folder_path, d).replace("\\", "/")
+                if sub_folder_relative_path in folder_parent_ids:
+                    continue
+                folder_title = to_title(d)
+                folder_page_id = ensure_folder_page(folder_title, current_confluence_parent_id)
+                folder_parent_ids[sub_folder_relative_path] = folder_page_id
+    else:
+        print(f"Warning: '{DOCS_FOLDER}' directory not found. No Markdown files to process.")
+
+    # --- 3. Discover Local Markdown Files & Prepare Their Content ---
+    local_markdown_pages = {}
+
     if os.path.isdir(DOCS_FOLDER):
-        for root, _, files in os.walk(DOCS_FOLDER):
+        for root, dirs, files in os.walk(DOCS_FOLDER):
             rel = os.path.relpath(root, DOCS_FOLDER)
             folder_path = "" if rel == "." else rel.replace("\\", "/")
-            parent_id = folder_parent_ids[folder_path]
-            for filename in files:
-                if not filename.endswith(".md"): continue
-                filepath = os.path.join(root, filename)
-                with open(filepath, "r", encoding="utf-8") as f: md_content = f.read()
-                title = (
-                    "Documentation Home" if folder_path == "" and os.path.splitext(filename)[0].lower() == "index" else
-                    to_title(os.path.basename(folder_path)) if os.path.splitext(filename)[0].lower() == "index" else
-                    to_title(os.path.splitext(filename)[0])
-                )
-                key = (parent_id, title)
-                local_pages[key] = {"title": title, "storage": markdown_to_storage(md_content), "hash": md5(markdown_to_storage(md_content)), "parent_id": parent_id, "filepath": filepath}
+            confluence_parent_id_for_current_folder = folder_parent_ids[folder_path]
 
-    remote_pages = {}
-    start, limit = 0, 200
+            for filename in files:
+                if not filename.endswith(".md"):
+                    continue
+
+                filepath = os.path.join(root, filename)
+                with open(filepath, "r", encoding="utf-8") as f:
+                    md_content = f.read()
+
+                name_no_ext = os.path.splitext(filename)[0]
+                if folder_path == "" and name_no_ext.lower() == "index":
+                    title = "Documentation Home"
+                elif name_no_ext.lower() == "index":
+                    title = to_title(os.path.basename(folder_path))
+                else:
+                    title = to_title(name_no_ext)
+
+                storage = markdown_to_storage(md_content)
+                content_hash = md5(storage)
+
+                key = (confluence_parent_id_for_current_folder, title)
+                local_markdown_pages[key] = {
+                    "title": title,
+                    "storage": storage,
+                    "hash": content_hash,
+                    "parent_id": confluence_parent_id_for_current_folder,
+                    "filepath": filepath,
+                }
+
+    # --- 4. Fetch ALL existing pages in the Confluence space ---
+    all_existing_confluence_pages_by_key = {}
+    all_existing_confluence_pages_by_id = {}
+
+    start = 0
+    limit = 200
     while True:
         try:
-            chunk = confluence.get_all_pages_from_space(CONFLUENCE_SPACE_KEY, start=start, limit=limit, expand='ancestors,body.storage,version')
-            if not chunk: break
-            for page in chunk:
+            pages_chunk = confluence.get_all_pages_from_space(
+                CONFLUENCE_SPACE_KEY, start=start, limit=limit, expand='ancestors,body.storage,version'
+            )
+            if not pages_chunk:
+                break
+
+            for page in pages_chunk:
+                page_id = page['id']
+                title = page['title']
                 parent_id = page['ancestors'][-1]['id'] if page.get('ancestors') else None
-                remote_pages[(parent_id, page['title'])] = {
-                    "id": page['id'],
-                    "title": page['title'],
-                    "hash": md5(page.get('body',{}).get('storage',{}).get('value','')),
-                    "version": page['version']['number']
+                storage = page.get('body', {}).get('storage', {}).get('value', '')
+                version = page.get('version', {}).get('number', 1)
+
+                page_info = {
+                    "id": page_id,
+                    "title": title,
+                    "parent_id": parent_id,
+                    "hash": md5(storage),
+                    "version": version,
                 }
-            if len(chunk) < limit: break
+                all_existing_confluence_pages_by_id[page_id] = page_info
+                all_existing_confluence_pages_by_key[(parent_id, title)] = page_info
+
+            if len(pages_chunk) < limit:
+                break
             start += limit
-        except Exception as e: print(f"Error fetching pages: {e}"); sys.exit(1)
+        except Exception as e:
+            print(f"Error fetching all pages from space (start={start}): {e}")
+            sys.exit(1)
 
-    to_create, to_update, to_archive_or_delete = [], [], []
-    for key, local in local_pages.items():
-        remote = remote_pages.get(key)
-        if not remote:
-            existing_anywhere = find_page_in_space_by_title(local['title'])
-            if existing_anywhere:
-                to_update.append({"id": existing_anywhere['id'], "version": existing_anywhere['version']['number'], **local, "action": "move"})
+    # --- 5. Determine Actions: Create, Update/Move, Delete ---
+    pages_to_create = []
+    pages_to_update_or_move = []
+    pages_to_delete = []
+
+    # Identify pages to create or update/move
+    for key, local_info in local_markdown_pages.items():
+        expected_parent_id = key[0]
+        title = key[1]
+
+        existing_in_correct_place = all_existing_confluence_pages_by_key.get(key)
+        existing_anywhere_by_title = find_page_in_space_by_title(title)
+
+        if not existing_in_correct_place and not existing_anywhere_by_title:
+            # Page does not exist in Confluence at all -> Create
+            pages_to_create.append(local_info)
+        else:
+            remote_info = existing_in_correct_place or existing_anywhere_by_title
+            needs_move = str(remote_info['parent_id']) != str(expected_parent_id)
+            needs_update = local_info['hash'] != remote_info['hash']
+
+            if needs_move or needs_update:
+                pages_to_update_or_move.append({
+                    "id": remote_info['id'],
+                    "title": local_info['title'],
+                    "storage": local_info['storage'],
+                    "filepath": local_info['filepath'],
+                    "target_parent_id": expected_parent_id,
+                    "version": remote_info['version'],
+                    "current_parent_id": remote_info['parent_id'],
+                })
             else:
-                to_create.append(local)
-        elif local['hash'] != remote['hash']:
-            to_update.append({"id": remote['id'], "version": remote['version'], **local, "action": "update"})
+                print(f"Up to date: {local_info['filepath']} -> '{title}' under parent {expected_parent_id}")
 
-    for remote_key, remote in remote_pages.items():
-        page_id = remote['id']
-        if str(page_id) == str(CONFLUENCE_PARENT_PAGE_ID) or (CONFLUENCE_ARCHIVE_PARENT_PAGE_ID and str(page_id) == str(CONFLUENCE_ARCHIVE_PARENT_PAGE_ID)):
+    # Identify pages to delete
+    # Only delete pages that:
+    # 1. Exist in Confluence but NOT in local markdown pages
+    # 2. Are NOT the configured parent page itself
+    # 3. If they are a folder page, only delete if they have no children
+    for remote_key, remote_info in all_existing_confluence_pages_by_key.items():
+        page_id = remote_info['id']
+        title = remote_info['title']
+
+        # Skip the configured parent page itself
+        if str(page_id) == str(CONFLUENCE_PARENT_PAGE_ID):
             continue
-        if remote_key not in local_pages.keys():
-            is_folder = page_id in folder_parent_ids.values()
-            if is_folder and confluence.get_child_pages(page_id):
-                continue
-            to_archive_or_delete.append(remote)
+
+        # Skip pages that exist in our local markdown set
+        if remote_key in local_markdown_pages:
+            continue
+
+        # Check if this is a managed folder page
+        is_managed_folder_page = page_id in folder_parent_ids.values()
+
+        # Check if this page has any children
+        children_of_this_page = confluence.get_child_pages(page_id)
+
+        if is_managed_folder_page and children_of_this_page:
+            # Folder page still has children -> skip deletion to avoid orphaning content
+            print(
+                f"Skipping deletion of folder page '{title}' (ID {page_id}) "
+                f"as it still has child pages."
+            )
+            continue
+
+        # Safe to delete: no children, or not a folder page
+        pages_to_delete.append(remote_info)
 
     # --- 6. Execute Actions ---
-    # ... create and update logic ...
 
-    for p in to_archive_or_delete:
-        page_title = p['title']
-        page_id = p['id']
-        if CONFLUENCE_ARCHIVE_PARENT_PAGE_ID:
-            print(f"Archiving page '{page_title}' (ID {page_id}).")
-            try:
-                current_page = confluence.get_page_by_id(page_id, expand='body.storage,version')
-                current_body = current_page['body']['storage']['value']
-                current_version = current_page['version']['number']
-                # *** ENHANCED ERROR LOGGING HERE ***
-                confluence.update_page(
-                    page_id=page_id,
-                    title=page_title,
-                    body=current_body,
-                    parent_id=CONFLUENCE_ARCHIVE_PARENT_PAGE_ID,
-                    # No version number for this call
-                )
-                print(f"Successfully archived '{page_title}'.") # This will likely not be printed
-            except Exception as e:
-                # This will print the full, detailed error from the Confluence API
-                print(f"!!!!! FAILED to archive page '{page_title}' (ID {page_id}). API ERROR: !!!!!")
-                if hasattr(e, 'response') and e.response is not None:
-                    print(f"Status Code: {e.response.status_code}")
-                    print(f"Response Text: {e.response.text}")
-                else:
-                    print(f"A non-HTTP error occurred: {e}")
-                print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    # Create new pages
+    for p in pages_to_create:
+        print(f"Creating page '{p['title']}' under parent {p['parent_id']} from {p['filepath']}.")
+        try:
+            confluence.create_page(
+                space=CONFLUENCE_SPACE_KEY,
+                parent_id=p["parent_id"],
+                title=p["title"],
+                body=p["storage"],
+                representation="storage",
+            )
+            print(f"Successfully created '{p['title']}'.")
+        except Exception as e:
+            print(f"Error creating page '{p['title']}': {e}")
 
-        else:
-            # Deletion logic as fallback
-            print(f"Deleting page '{page_title}' (ID {page_id}).")
-            try:
-                confluence.remove_page(page_id=page_id, recursive=False)
-            except Exception as e:
-                print(f"Error deleting page: {e}")
+    # Update or move existing pages
+    for p in pages_to_update_or_move:
+        move_desc = f"moving from parent {p['current_parent_id']} to {p['target_parent_id']}" if str(p['current_parent_id']) != str(p['target_parent_id']) else "updating content"
+        print(f"Processing page '{p['title']}' (ID {p['id']}): {move_desc} from {p['filepath']}.")
+        try:
+            confluence.update_page(
+                page_id=p["id"],
+                title=p["title"],
+                body=p["storage"],
+                parent_id=p["target_parent_id"],
+            )
+            print(f"Successfully updated/moved '{p['title']}'.")
+        except Exception as e:
+            print(f"Error updating/moving page '{p['title']}' (ID {p['id']}): {e}")
 
+    # Delete pages no longer in Git repo
+    for p in pages_to_delete:
+        print(f"Deleting page '{p['title']}' (ID {p['id']}) as it no longer exists in the Git repo.")
+        try:
+            confluence.remove_page(page_id=p["id"], recursive=False)
+            print(f"Successfully deleted '{p['title']}'.")
+        except Exception as e:
+            print(f"Error deleting page '{p['title']}' (ID {p['id']}): {e}")
+
+    # --- 7. Summary ---
+    print("\n========== Sync Summary ==========")
+    print(f"Pages created  : {len(pages_to_create)}")
+    print(f"Pages updated  : {len(pages_to_update_or_move)}")
+    print(f"Pages deleted  : {len(pages_to_delete)}")
+    print("===================================")
     print("Sync complete.")
 
 if __name__ == "__main__":
