@@ -50,8 +50,9 @@ def ensure_folder_page(folder_title: str, parent_id: str) -> str:
         if str(current_parent_id) != str(parent_id):
             print(f"Moving existing folder page '{folder_title}' (ID {page_id}) to be under parent {parent_id}.")
             body_content = existing.get('body', {}).get('storage', {}).get('value', '')
+            # No version needed for this library's update_page
             confluence.update_page(
-                page_id=page_id, title=folder_title, body=body_content, parent_id=parent_id, version=existing['version']['number'] + 1
+                page_id=page_id, title=folder_title, body=body_content, parent_id=parent_id
             )
         return page_id
 
@@ -108,7 +109,8 @@ def main():
                     to_title(os.path.splitext(filename)[0])
                 )
                 key = (parent_id, title)
-                local_pages[key] = {"title": title, "storage": markdown_to_storage(md_content), "hash": md5(markdown_to_storage(md_content)), "parent_id": parent_id, "filepath": filepath}
+                storage = markdown_to_storage(md_content)
+                local_pages[key] = {"title": title, "storage": storage, "hash": md5(storage), "parent_id": parent_id, "filepath": filepath}
 
     # --- 4. Fetch All Remote Pages ---
     remote_pages = {}
@@ -119,10 +121,9 @@ def main():
             if not chunk: break
             for page in chunk:
                 parent_id = page['ancestors'][-1]['id'] if page.get('ancestors') else None
-                # *** THE FIX IS HERE: Ensure 'title' is included in the dictionary ***
                 remote_pages[(parent_id, page['title'])] = {
-                    "id": page['id'], 
-                    "title": page['title'], # <-- This was missing
+                    "id": page['id'],
+                    "title": page['title'],
                     "hash": md5(page.get('body',{}).get('storage',{}).get('value','')),
                     "version": page['version']['number']
                 }
@@ -137,22 +138,22 @@ def main():
         if not remote:
             existing_anywhere = find_page_in_space_by_title(local['title'])
             if existing_anywhere:
-                to_update.append({"id": existing_anywhere['id'], "version": existing_anywhere['version']['number'], **local, "action": "move"})
+                to_update.append({"id": existing_anywhere['id'], **local, "action": "move"})
             else:
                 to_create.append(local)
         elif local['hash'] != remote['hash']:
-            to_update.append({"id": remote['id'], "version": remote['version'], **local, "action": "update"})
+            to_update.append({"id": remote['id'], **local, "action": "update"})
         else:
             print(f"Up to date: {local['filepath']}")
 
     for remote_key, remote in remote_pages.items():
-        page_id = remote['id']
+        page_id, title = remote['id'], remote['title']
         if str(page_id) == str(CONFLUENCE_PARENT_PAGE_ID) or (CONFLUENCE_ARCHIVE_PARENT_PAGE_ID and str(page_id) == str(CONFLUENCE_ARCHIVE_PARENT_PAGE_ID)):
             continue
         if remote_key not in local_pages.keys():
             is_folder = page_id in folder_parent_ids.values()
             if is_folder and confluence.get_child_pages(page_id):
-                print(f"Skipping archive of FOLDER page '{remote['title']}' (ID {page_id}) as it has children.")
+                print(f"Skipping archive of FOLDER page '{title}' (ID {page_id}) as it has children.")
                 continue
             to_archive_or_delete.append(remote)
 
@@ -164,19 +165,23 @@ def main():
 
     for p in to_update:
         print(f"Updating page '{p['title']}' (ID {p['id']}) - Action: {p['action']}.")
-        try: confluence.update_page(page_id=p["id"], title=p["title"], body=p["storage"], parent_id=p["parent_id"], version=p["version"] + 1)
+        try: confluence.update_page(page_id=p["id"], title=p["title"], body=p["storage"], parent_id=p["parent_id"])
         except Exception as e: print(f"Error updating page: {e}")
 
     for p in to_archive_or_delete:
-        page_title = p['title'] # This will now work correctly
-        page_id = p['id']
+        page_title, page_id = p['title'], p['id']
         if CONFLUENCE_ARCHIVE_PARENT_PAGE_ID:
             print(f"Archiving page '{page_title}' (ID {page_id}).")
             try:
-                current_page = confluence.get_page_by_id(page_id, expand='body.storage,version')
+                current_page = confluence.get_page_by_id(page_id, expand='body.storage')
                 current_body = current_page['body']['storage']['value']
-                current_version = current_page['version']['number']
-                confluence.update_page(page_id=page_id, title=page_title, body=current_body, parent_id=CONFLUENCE_ARCHIVE_PARENT_PAGE_ID, version=current_version + 1)
+                # *** THE FIX IS HERE: Removed the invalid 'version' keyword ***
+                confluence.update_page(
+                    page_id=page_id,
+                    title=page_title,
+                    body=current_body,
+                    parent_id=CONFLUENCE_ARCHIVE_PARENT_PAGE_ID
+                )
             except Exception as e: print(f"Error archiving page: {e}")
         else:
             print(f"Deleting page '{page_title}' (ID {page_id}).")
