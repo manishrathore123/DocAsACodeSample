@@ -88,8 +88,7 @@ def main():
             for d in dirs:
                 sub_path = os.path.join(folder_path, d).replace("\\", "/")
                 if sub_path in folder_parent_ids: continue
-                folder_title = to_title(d)
-                folder_page_id = ensure_folder_page(folder_title, parent_id)
+                folder_page_id = ensure_folder_page(to_title(d), parent_id)
                 folder_parent_ids[sub_path] = folder_page_id
 
     # --- 3. Discover Local Files ---
@@ -120,13 +119,19 @@ def main():
             if not chunk: break
             for page in chunk:
                 parent_id = page['ancestors'][-1]['id'] if page.get('ancestors') else None
-                remote_pages[(parent_id, page['title'])] = {"id": page['id'], "hash": md5(page.get('body',{}).get('storage',{}).get('value','')), "version": page['version']['number']}
+                # *** THE FIX IS HERE: Ensure 'title' is included in the dictionary ***
+                remote_pages[(parent_id, page['title'])] = {
+                    "id": page['id'], 
+                    "title": page['title'], # <-- This was missing
+                    "hash": md5(page.get('body',{}).get('storage',{}).get('value','')),
+                    "version": page['version']['number']
+                }
             if len(chunk) < limit: break
             start += limit
         except Exception as e: print(f"Error fetching pages: {e}"); sys.exit(1)
 
     # --- 5. Determine Actions ---
-    to_create, to_update, to_archive = [], [], []
+    to_create, to_update, to_archive_or_delete = [], [], []
     for key, local in local_pages.items():
         remote = remote_pages.get(key)
         if not remote:
@@ -147,9 +152,9 @@ def main():
         if remote_key not in local_pages.keys():
             is_folder = page_id in folder_parent_ids.values()
             if is_folder and confluence.get_child_pages(page_id):
-                print(f"Skipping archive of FOLDER page '{remote_key[1]}' (ID {page_id}) as it has children.")
+                print(f"Skipping archive of FOLDER page '{remote['title']}' (ID {page_id}) as it has children.")
                 continue
-            to_archive.append(remote)
+            to_archive_or_delete.append(remote)
 
     # --- 6. Execute Actions ---
     for p in to_create:
@@ -162,8 +167,8 @@ def main():
         try: confluence.update_page(page_id=p["id"], title=p["title"], body=p["storage"], parent_id=p["parent_id"], version=p["version"] + 1)
         except Exception as e: print(f"Error updating page: {e}")
 
-    for p in to_archive:
-        page_title = p['title']
+    for p in to_archive_or_delete:
+        page_title = p['title'] # This will now work correctly
         page_id = p['id']
         if CONFLUENCE_ARCHIVE_PARENT_PAGE_ID:
             print(f"Archiving page '{page_title}' (ID {page_id}).")
@@ -182,7 +187,7 @@ def main():
     print("\n========== Sync Summary ==========")
     print(f"Pages created  : {len(to_create)}")
     print(f"Pages updated  : {len(to_update)}")
-    print(f"Pages archived/deleted : {len(to_archive)}")
+    print(f"Pages archived/deleted : {len(to_archive_or_delete)}")
     print("===================================")
     print("Sync complete.")
 
