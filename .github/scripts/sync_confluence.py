@@ -116,38 +116,30 @@ def main():
             for filename in files:
                 if not filename.endswith(".md"): continue
                 filepath = os.path.join(root, filename)
-                with open(filepath, "r", encoding="utf-8") as f:
-                    md_content = f.read()
-
+                with open(filepath, "r", encoding="utf-8") as f: md_content = f.read()
                 name_no_ext = os.path.splitext(filename)[0]
-                if folder_path == "" and name_no_ext.lower() == "index":
-                    title = "Documentation Home"
-                elif name_no_ext.lower() == "index":
-                    title = to_title(os.path.basename(folder_path))
-                else:
-                    title = to_title(name_no_ext)
-
+                title = (
+                    "Documentation Home" if folder_path == "" and name_no_ext.lower() == "index" else
+                    to_title(os.path.basename(folder_path)) if name_no_ext.lower() == "index" else
+                    to_title(name_no_ext)
+                )
                 storage = markdown_to_storage(md_content)
-                content_hash = md5(storage)
-                key = (confluence_parent_id_for_current_folder, title)
-                local_markdown_pages[key] = {"title": title, "storage": storage, "hash": content_hash, "parent_id": confluence_parent_id_for_current_folder, "filepath": filepath}
+                local_markdown_pages[(confluence_parent_id_for_current_folder, title)] = {"title": title, "storage": storage, "hash": md5(storage), "parent_id": confluence_parent_id_for_current_folder, "filepath": filepath}
 
     # --- 4. Fetch ALL existing pages in the Confluence space ---
     all_existing_confluence_pages_by_key = {}
-    start = 0
-    limit = 200
+    start, limit = 0, 200
     while True:
         try:
             pages_chunk = confluence.get_all_pages_from_space(CONFLUENCE_SPACE_KEY, start=start, limit=limit, expand='ancestors,body.storage,version')
             if not pages_chunk: break
             for page in pages_chunk:
                 parent_id = page['ancestors'][-1]['id'] if page.get('ancestors') else None
-                all_existing_confluence_pages_by_key[(parent_id, page['title'])] = {"id": page['id'],"title": page['title'],"parent_id": parent_id,"hash": md5(page.get('body', {}).get('storage', {}).get('value', '')),"version": page.get('version', {}).get('number', 1)}
+                all_existing_confluence_pages_by_key[(parent_id, page['title'])] = {"id": page['id'], "title": page['title'], "parent_id": parent_id, "hash": md5(page.get('body', {}).get('storage', {}).get('value', '')), "version": page.get('version', {}).get('number', 1)}
             if len(pages_chunk) < limit: break
             start += limit
         except Exception as e:
-            print(f"Error fetching all pages from space: {e}")
-            sys.exit(1)
+            print(f"Error fetching pages: {e}"); sys.exit(1)
 
     # --- 5. Determine Actions ---
     pages_to_create, pages_to_update_or_move, pages_to_archive_or_delete = [], [], []
@@ -162,12 +154,13 @@ def main():
             needs_move = str(remote_info['parent_id']) != str(expected_parent_id)
             needs_update = local_info['hash'] != remote_info['hash']
             if needs_move or needs_update:
-                pages_to_update_or_move.append({"id": remote_info['id'],"title": local_info['title'],"storage": local_info['storage'],"filepath": local_info['filepath'],"target_parent_id": expected_parent_id})
+                pages_to_update_or_move.append({"id": remote_info['id'], "title": local_info['title'], "storage": local_info['storage'], "filepath": local_info['filepath'], "target_parent_id": expected_parent_id})
             else:
                 print(f"Up to date: {local_info['filepath']} -> '{title}'")
 
     for remote_key, remote_info in all_existing_confluence_pages_by_key.items():
         page_id, title = remote_info['id'], remote_info['title']
+        # SAFETY CHECK: Never delete the root parent or archive parent pages
         if str(page_id) == str(CONFLUENCE_PARENT_PAGE_ID) or (CONFLUENCE_ARCHIVE_PARENT_PAGE_ID and str(page_id) == str(CONFLUENCE_ARCHIVE_PARENT_PAGE_ID)):
             continue
         if remote_key not in local_markdown_pages.keys():
@@ -181,17 +174,13 @@ def main():
     # --- 6. Execute Actions ---
     for p in pages_to_create:
         print(f"Creating page '{p['title']}' under parent {p['parent_id']} from {p['filepath']}.")
-        try:
-            confluence.create_page(space=CONFLUENCE_SPACE_KEY, parent_id=p["parent_id"], title=p["title"], body=p["storage"], representation="storage")
-        except Exception as e:
-            print(f"Error creating page '{p['title']}': {e}")
+        try: confluence.create_page(space=CONFLUENCE_SPACE_KEY, parent_id=p["parent_id"], title=p["title"], body=p["storage"], representation="storage")
+        except Exception as e: print(f"Error creating page '{p['title']}': {e}")
 
     for p in pages_to_update_or_move:
-        print(f"Updating page '{p['title']}' (ID {p['id']}) from {p['filepath']}.")
-        try:
-            confluence.update_page(page_id=p["id"], title=p["title"], body=p["storage"], parent_id=p["target_parent_id"])
-        except Exception as e:
-            print(f"Error updating page '{p['title']}' (ID {p['id']}): {e}")
+        print(f"Updating/Moving page '{p['title']}' (ID {p['id']}) from {p['filepath']}.")
+        try: confluence.update_page(page_id=p["id"], title=p["title"], body=p["storage"], parent_id=p["target_parent_id"])
+        except Exception as e: print(f"Error updating page '{p['title']}' (ID {p['id']}): {e}")
 
     for p in pages_to_archive_or_delete:
         if CONFLUENCE_ARCHIVE_PARENT_PAGE_ID:
@@ -199,14 +188,11 @@ def main():
             try:
                 current_body = confluence.get_page_by_id(p['id'], expand='body.storage')['body']['storage']['value']
                 confluence.update_page(page_id=p["id"], title=p["title"], body=current_body, parent_id=CONFLUENCE_ARCHIVE_PARENT_PAGE_ID)
-            except Exception as e:
-                print(f"Error archiving page '{p['title']}' (ID {p['id']}): {e}")
+            except Exception as e: print(f"Error archiving page '{p['title']}' (ID {p['id']}): {e}")
         else:
             print(f"Deleting page '{p['title']}' (ID {p['id']}) as it no longer exists in Git repo.")
-            try:
-                confluence.remove_page(page_id=p["id"], recursive=False)
-            except Exception as e:
-                print(f"Error deleting page '{p['title']}' (ID {p['id']}): {e}")
+            try: confluence.remove_page(page_id=p["id"], recursive=False)
+            except Exception as e: print(f"Error deleting page '{p['title']}' (ID {p['id']}): {e}")
 
     # --- 7. Summary ---
     print("\n========== Sync Summary ==========")
