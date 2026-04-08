@@ -1,1 +1,0 @@
-This is doc 2  file in sub directory 1.DEMO
