@@ -1,1 +1,1 @@
-Welcome to Confluence Docs This is index file in recursive
+Welcome to Confluence Docs This is index file in documentation directory.
