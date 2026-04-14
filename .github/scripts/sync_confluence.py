@@ -11,7 +11,6 @@ CONFLUENCE_USERNAME = os.environ.get('CONFLUENCE_USERNAME')
 CONFLUENCE_API_TOKEN = os.environ.get('CONFLUENCE_API_TOKEN')
 CONFLUENCE_SPACE_KEY = os.environ.get('CONFLUENCE_SPACE_KEY')
 CONFLUENCE_PARENT_PAGE_ID = os.environ.get('CONFLUENCE_PARENT_PAGE_ID')
-CONFLUENCE_ARCHIVE_PARENT_PAGE_ID = os.environ.get('CONFLUENCE_ARCHIVE_PARENT_PAGE_ID')
 
 DOCS_FOLDER = "docs"
 
@@ -31,34 +30,19 @@ def to_title(name: str) -> str:
 def markdown_to_storage(md_content: str) -> str:
     """
     Converts Markdown to Confluence Storage Format, with special handling for Mermaid diagrams.
-    This version uses a splitting method to avoid complex regex and string formatting issues.
     """
-    # Define the start and end fences for a mermaid block
     mermaid_start_fence = '```mermaid'
     mermaid_end_fence = '```'
-
-    # Split the document into parts based on the mermaid start fence
     parts = md_content.split(mermaid_start_fence)
+    final_html = markdown.markdown(parts[0])
 
-    final_html = ""
-
-    # The first part is always standard markdown
-    final_html += markdown.markdown(parts[0])
-
-    # Process subsequent parts
     for part in parts[1:]:
-        # Each part will contain a diagram and then more markdown
         try:
             diagram_code, remaining_md = part.split(mermaid_end_fence, 1)
         except ValueError:
-            # This handles the case of a missing closing fence
-            diagram_code = part
-            remaining_md = ""
-
-        # Trim the diagram code
+            diagram_code, remaining_md = part, ""
+        
         diagram_code = diagram_code.strip()
-
-        # Create the Confluence macro for the mermaid diagram
         confluence_macro = (
             '<ac:structured-macro ac:name="mermaid">'
             + '<ac:plain-text-body><![CDATA['
@@ -67,8 +51,6 @@ def markdown_to_storage(md_content: str) -> str:
             + '</ac:structured-macro>'
         )
         final_html += confluence_macro
-
-        # Convert the remaining markdown part to HTML
         final_html += markdown.markdown(remaining_md)
 
     return f'<div class="markdown-body">{final_html}</div>'
@@ -100,13 +82,7 @@ def main():
     if not all([CONFLUENCE_URL, CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACE_KEY, CONFLUENCE_PARENT_PAGE_ID]):
         print("Error: Missing required env vars."); sys.exit(1)
 
-    print(f"Starting sync...")
-    if CONFLUENCE_ARCHIVE_PARENT_PAGE_ID:
-        print(f"Archiving enabled.")
-        try: confluence.get_page_by_id(CONFLUENCE_ARCHIVE_PARENT_PAGE_ID)
-        except Exception: print(f"Error: Archive parent page ID not found."); sys.exit(1)
-    else:
-        print(f"Archiving disabled.")
+    print(f"Starting sync: Markdown files from '{DOCS_FOLDER}' to Confluence space '{CONFLUENCE_SPACE_KEY}'.")
 
     folder_parent_ids = {"": CONFLUENCE_PARENT_PAGE_ID}
     if os.path.isdir(DOCS_FOLDER):
@@ -152,7 +128,7 @@ def main():
             start += limit
         except Exception as e: print(f"Error fetching pages: {e}"); sys.exit(1)
 
-    to_create, to_update, to_archive_or_delete = [], [], []
+    to_create, to_update, to_delete = [], [], []
     for key, local in local_pages.items():
         remote = remote_pages.get(key)
         if not remote:
@@ -166,14 +142,14 @@ def main():
 
     for remote_key, remote in remote_pages.items():
         page_id, title = remote['id'], remote['title']
-        if str(page_id) == str(CONFLUENCE_PARENT_PAGE_ID) or (CONFLUENCE_ARCHIVE_PARENT_PAGE_ID and str(page_id) == str(CONFLUENCE_ARCHIVE_PARENT_PAGE_ID)):
+        if str(page_id) == str(CONFLUENCE_PARENT_PAGE_ID):
             continue
         if remote_key not in local_pages.keys():
             is_folder = page_id in folder_parent_ids.values()
             if is_folder and confluence.get_child_pages(page_id):
-                print(f"Skipping archive of FOLDER page '{title}' (ID {page_id}) as it has children.")
+                print(f"Skipping deletion of FOLDER page '{title}' (ID {page_id}) as it has children.")
                 continue
-            to_archive_or_delete.append(remote)
+            to_delete.append(remote)
 
     for p in to_create:
         print(f"Creating page '{p['title']}' under parent {p['parent_id']}.")
@@ -186,25 +162,16 @@ def main():
             confluence.update_page(page_id=p["id"], title=p["title"], body=p["storage"], parent_id=p["parent_id"])
         except Exception as e: print(f"Error updating page: {e}")
 
-    for p in to_archive_or_delete:
+    for p in to_delete:
         page_title, page_id = p['title'], p['id']
-        if CONFLUENCE_ARCHIVE_PARENT_PAGE_ID:
-            print(f"Archiving page '{page_title}' (ID {page_id}).")
-            try:
-                current_body = confluence.get_page_by_id(page_id, expand='body.storage')['body']['storage']['value']
-                confluence.update_page(page_id=page_id, title=page_title, body=current_body, parent_id=CONFLUENCE_ARCHIVE_PARENT_PAGE_ID)
-            except Exception as e:
-                print(f"Error archiving page: {e}")
-        else:
-            print(f"Deleting page '{page_title}' (ID {page_id}).")
-            try: confluence.remove_page(page_id=p["id"], recursive=False)
-            except Exception as e: print(f"Error deleting page: {e}")
+        print(f"Deleting page '{page_title}' (ID {page_id}).")
+        try: confluence.remove_page(page_id=page_id, recursive=False)
+        except Exception as e: print(f"Error deleting page: {e}")
 
-    # --- 7. Summary ---
     print("\n========== Sync Summary ==========")
     print(f"Pages created: {len(to_create)}")
     print(f"Pages updated/moved: {len(to_update)}")
-    print(f"Pages archived/deleted: {len(to_archive_or_delete)}")
+    print(f"Pages deleted: {len(to_delete)}")
     print("===================================")
     print("Sync complete.")
 
