@@ -30,12 +30,18 @@ def to_title(name: str) -> str:
 def markdown_to_storage(md_content: str) -> str:
     """
     Converts Markdown to Confluence Storage Format, with special handling for Mermaid diagrams.
+    This version processes content in chunks to avoid nesting macros inside other elements.
     """
     mermaid_start_fence = '```mermaid'
     mermaid_end_fence = '```'
     parts = md_content.split(mermaid_start_fence)
-    final_html = markdown.markdown(parts[0])
+    final_html = ""
 
+    # The first part is always standard markdown. Convert and wrap it.
+    if parts[0]:
+        final_html += f'<div class="markdown-body">{markdown.markdown(parts[0])}</div>'
+
+    # Process subsequent parts which will start with a diagram
     for part in parts[1:]:
         try:
             diagram_code, remaining_md = part.split(mermaid_end_fence, 1)
@@ -43,6 +49,7 @@ def markdown_to_storage(md_content: str) -> str:
             diagram_code, remaining_md = part, ""
         
         diagram_code = diagram_code.strip()
+        # Create the Confluence macro. It will be a top-level element.
         confluence_macro = (
             '<ac:structured-macro ac:name="mermaid">'
             + '<ac:plain-text-body><![CDATA['
@@ -51,9 +58,12 @@ def markdown_to_storage(md_content: str) -> str:
             + '</ac:structured-macro>'
         )
         final_html += confluence_macro
-        final_html += markdown.markdown(remaining_md)
 
-    return f'<div class="markdown-body">{final_html}</div>'
+        # If there is remaining markdown after the diagram, convert and wrap it.
+        if remaining_md.strip():
+            final_html += f'<div class="markdown-body">{markdown.markdown(remaining_md)}</div>'
+
+    return final_html
 
 def find_page_in_space_by_title(title: str):
     try:
