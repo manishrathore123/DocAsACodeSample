@@ -16,7 +16,7 @@ CONFLUENCE_PARENT_PAGE_ID = os.environ.get('CONFLUENCE_PARENT_PAGE_ID')
 CONFLUENCE_ARCHIVE_PARENT_PAGE_ID = os.environ.get('CONFLUENCE_ARCHIVE_PARENT_PAGE_ID')
 
 DOCS_FOLDER = "docs"
-ARCHIVE_FOLDER_TITLE = "Archive"  # Title used if we must create an archive page under the archive parent
+ARCHIVE_FOLDER_TITLE = "Archive"  # Title used if we must create an archive page under the main parent
 
 confluence = Confluence(
     url=CONFLUENCE_URL,
@@ -56,22 +56,24 @@ def find_page_in_space_by_title(title: str):
 def ensure_folder_page(folder_title: str, parent_id: str) -> str:
     """
     Ensures a Confluence page exists with the given folder_title under parent_id.
-    If a page with folder_title already exists in the space and is under the same parent,
-    return it. If a same-title page exists elsewhere, create a new one under parent_id
-    (to avoid accidentally moving unrelated content).
-    Returns the ID of the existing or newly created folder page.
+    - If a page with folder_title already exists AND is a descendant of parent_id, return its id.
+    - If a same-title page exists elsewhere, create a NEW page under parent_id
+      (to avoid accidentally moving unrelated content).
+    - If it doesn't exist, create it.
+    Always re-fetch and return the page id for the page that actually lives under parent_id.
     """
-    # 1) Try to find an existing page with title under the desired parent using CQL (preferred)
+    # 1) Try to find a page with that title that is a descendant of parent_id using CQL (preferred)
     try:
         cql = f'title = "{folder_title}" AND ancestor = {parent_id} AND type = page'
         res = confluence.cql(cql, limit=1, expand='content.id,content.title')
         if res and res.get('results'):
             return res['results'][0]['content']['id']
     except Exception:
-        # If CQL not available or fails, fall back
+        # Fall back to the simpler approach if CQL is not available for some reason
         pass
 
-    # 2) If there's a page with that title anywhere, check if it's already under the parent
+    # 2) If there is any page with that title (but not under parent_id), prefer creating a new page
+    #    under the requested parent rather than moving the possibly unrelated existing page.
     existing = None
     try:
         existing = confluence.get_page_by_title(
@@ -90,10 +92,10 @@ def ensure_folder_page(folder_title: str, parent_id: str) -> str:
                     return existing['id']
         except Exception:
             pass
-        # If we found an existing page but not under the parent, create a new one instead of moving
-        print(f"Found page titled '{folder_title}' but not under parent {parent_id}. Creating a new folder page under desired parent to avoid moving unrelated content.")
+        # Otherwise do NOT move the existing page; create a new one under the requested parent
+        print(f"Found page titled '{folder_title}' in space but not under parent {parent_id}. Creating a new folder page under the desired parent to avoid moving unrelated content.")
 
-    # 3) Create a new folder page under the requested parent
+    # 3) Create the folder page under the requested parent
     try:
         created = confluence.create_page(
             space=CONFLUENCE_SPACE_KEY,
@@ -102,12 +104,13 @@ def ensure_folder_page(folder_title: str, parent_id: str) -> str:
             body="",
             representation="storage",
         )
+        # Some versions return the page object with "id"; if not, re-fetch it by title+ancestor
         if created and isinstance(created, dict) and created.get('id'):
             return created['id']
     except Exception as e:
         print(f"Warning: create_page failed for '{folder_title}': {e}")
 
-    # 4) Final fallback: attempt to re-query with CQL/get_page_by_title
+    # 4) As a final fallback, re-query for the page under the parent (CQL or get_page_by_title + check)
     try:
         cql = f'title = "{folder_title}" AND ancestor = {parent_id} AND type = page'
         res = confluence.cql(cql, limit=1, expand='content.id')
@@ -116,6 +119,7 @@ def ensure_folder_page(folder_title: str, parent_id: str) -> str:
     except Exception:
         pass
 
+    # 5) Last resort: try get_page_by_title and return whatever id we can find
     try:
         fallback = confluence.get_page_by_title(space=CONFLUENCE_SPACE_KEY, title=folder_title)
         if fallback and fallback.get('id'):
@@ -270,26 +274,51 @@ def main():
         existing_in_correct_place = all_existing_confluence_pages_by_key.get(key)
         existing_anywhere_by_title = find_page_in_space_by_title(title)
 
-        if not existing_in_correct_place and not existing_anywhere_by_title:
+        # Normalize remote_info whether it came from the all_existing... map or from find_page_in_space_by_title()
+        if existing_in_correct_place:
+            remote_info = existing_in_correct_place
+        elif existing_anywhere_by_title:
+            # existing_anywhere_by_title is the raw page object from Confluence; normalize it to our page_info shape
+            page = existing_anywhere_by_title
+            try:
+                remote_parent_id = page['ancestors'][-1]['id'] if page.get('ancestors') else None
+            except Exception:
+                remote_parent_id = None
+
+            remote_storage = page.get('body', {}).get('storage', {}).get('value', '')
+            remote_version = page.get('version', {}).get('number', 1)
+            remote_info = {
+                "id": page.get('id'),
+                "title": page.get('title'),
+                "parent_id": remote_parent_id,
+                "storage": remote_storage,
+                "version": remote_version,
+                "hash": md5(remote_storage),
+            }
+        else:
+            remote_info = None
+
+        if not remote_info:
             # Page does not exist in Confluence at all -> Create
             pages_to_create.append(local_info)
-        else:
-            remote_info = existing_in_correct_place or existing_anywhere_by_title
-            needs_move = str(remote_info['parent_id']) != str(expected_parent_id)
-            needs_update = local_info['hash'] != remote_info['hash']
+            continue
 
-            if needs_move or needs_update:
-                pages_to_update_or_move.append({
-                    "id": remote_info['id'],
-                    "title": local_info['title'],
-                    "storage": local_info['storage'],
-                    "filepath": local_info['filepath'],
-                    "target_parent_id": expected_parent_id,
-                    "version": remote_info['version'],
-                    "current_parent_id": remote_info['parent_id'],
-                })
-            else:
-                print(f"Up to date: {local_info['filepath']} -> '{title}' under parent {expected_parent_id}")
+        # Now we can safely reference remote_info['parent_id'], etc.
+        needs_move = str(remote_info.get('parent_id') or '') != str(expected_parent_id or '')
+        needs_update = local_info['hash'] != remote_info.get('hash')
+
+        if needs_move or needs_update:
+            pages_to_update_or_move.append({
+                "id": remote_info['id'],
+                "title": local_info['title'],
+                "storage": local_info['storage'],
+                "filepath": local_info['filepath'],
+                "target_parent_id": expected_parent_id,
+                "version": remote_info.get('version'),
+                "current_parent_id": remote_info.get('parent_id'),
+            })
+        else:
+            print(f"Up to date: {local_info['filepath']} -> '{title}' under parent {expected_parent_id}")
 
     # Identify pages to archive (previously delete)
     for remote_key, remote_info in all_existing_confluence_pages_by_key.items():
