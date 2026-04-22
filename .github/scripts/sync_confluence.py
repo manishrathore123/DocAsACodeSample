@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import hashlib
 from datetime import datetime
 from atlassian import Confluence
@@ -33,9 +34,45 @@ def to_title(name: str) -> str:
     """Converts a file/folder name into a Confluence-friendly title."""
     return name.replace("-", " ").replace("_", " ").strip().title()
 
+def _mermaid_macro_from_source(src: str) -> str:
+    """
+    Return Confluence storage-format Mermaid macro wrapping the raw mermaid source.
+    Uses CDATA so the mermaid source is preserved verbatim.
+    """
+    # Strip leading/trailing whitespace but preserve internal newlines
+    src_clean = src.strip("\n")
+    # Build macro
+    macro = (
+        '<ac:structured-macro ac:name="mermaid">'
+        '<ac:plain-text-body><![CDATA[\n'
+        f'{src_clean}\n'
+        ']]></ac:plain-text-body>'
+        '</ac:structured-macro>'
+    )
+    return macro
+
 def markdown_to_storage(md_content: str) -> str:
-    """Converts Markdown content to Confluence storage format (HTML)."""
-    html = markdown.markdown(md_content)
+    """
+    Converts Markdown content to Confluence storage format (HTML), with special handling for
+    mermaid code fences. Mermaid fences (```mermaid ... ```) are replaced with the Confluence
+    mermaid macro in storage format so diagrams render in Confluence Cloud.
+    """
+    if not md_content:
+        return ""
+
+    # 1) Replace mermaid fenced blocks with the mermaid macro (preserve content)
+    # Pattern: ```mermaid\n...source...\n```
+    def _mermaid_repl(m):
+        src = m.group(1)
+        return _mermaid_macro_from_source(src)
+
+    md_with_macros = re.sub(r'```mermaid\s*\n(.*?)\n```', _mermaid_repl, md_content, flags=re.DOTALL | re.IGNORECASE)
+
+    # 2) Convert the rest of the markdown to HTML
+    # Use fenced_code extension so normal code fences render correctly (non-mermaid)
+    html = markdown.markdown(md_with_macros, extensions=['fenced_code', 'codehilite'])
+    # 3) Wrap in a safe container (Confluence storage format expects the body as storage XHTML-ish).
+    # We are returning a string that contains HTML + Confluence macro XML fragments.
     return f'<div class="markdown-body">{html}</div>'
 
 def find_page_in_space_by_title(title: str):
@@ -210,6 +247,7 @@ def main():
                 else:
                     title = to_title(name_no_ext)
 
+                # Convert markdown to Confluence storage format, with mermaid support
                 storage = markdown_to_storage(md_content)
                 content_hash = md5(storage)
 
