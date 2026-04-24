@@ -1,7 +1,5 @@
-### My Awesome Diagram
-```mermaid
-graph TD
-    A[Start] --> B(Sync Code);
-    B --> C{Success?};
-    C -->|Yes| D[Check Confluence];
-    C -->|No| F[Check Logs];
+graph TD;
+    A[Start] --> B{Is it working?};
+    B -- Yes --> C[Great!];
+    B -- No --> D[Check documentation];
+    D --> B;
