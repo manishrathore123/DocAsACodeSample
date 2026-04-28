@@ -9,6 +9,7 @@ import markdown
 # --- Configuration from environment ---
 CONFLUENCE_URL = os.environ.get('CONFLUENCE_URL')
 CONFLUENCE_USERNAME = os.environ.get('CONFLUENCE_USERNAME')
+# 1. CORRECTED VARIABLE NAME
 CONFLUENCE_API_TOKEN = os.environ.get('CONFLUENCE_API_TOKEN')
 CONFLUENCE_SPACE_KEY = os.environ.get('CONFLUENCE_SPACE_KEY')
 CONFLUENCE_PARENT_PAGE_ID = os.environ.get('CONFLUENCE_PARENT_PAGE_ID')
@@ -22,11 +23,11 @@ try:
     confluence = Confluence(
         url=CONFLUENCE_URL,
         username=CONFLUENCE_USERNAME,
-        password=CONFLUENCE_API_TOKEN,
+        password=CONFLUENCE_API_TOKEN, # Uses corrected variable
         cloud=True,
     )
 except Exception as e:
-    print(f"Error connecting to Confluence: {e}")
+    print(f"FATAL: Error connecting to Confluence. Check URL, username, and API token. Error: {e}")
     sys.exit(1)
 
 # --- Core Functions ---
@@ -41,38 +42,39 @@ def to_title(name: str) -> str:
 
 def markdown_to_storage(md_content: str) -> str:
     """
-    Converts Markdown to Confluence storage format. The crucial change is that this version
-    converts a ```mermaid block into a Confluence 'code' macro with the language set to 'mermaid',
-    which is the correct method for most modern Mermaid plugins.
+    Converts Markdown to Confluence storage format, with robust Mermaid support
+    using an HTML comment placeholder. This version correctly creates a 'code' macro.
     """
-    # This pattern will split the text by mermaid blocks, keeping the mermaid blocks as part of the list.
-    mermaid_pattern = re.compile(r"(```mermaid\n.*?\n```)", re.DOTALL)
-    parts = mermaid_pattern.split(md_content)
+    mermaid_blocks = {}
+    # Use an HTML comment as a placeholder, which markdown parsers will ignore.
+    placeholder_template = "<!--MERMAID_PLACEHOLDER_{}-->"
     
-    final_html_parts = []
-    
-    for part in parts:
-        # Check if the part is a mermaid block
-        if part.startswith("```mermaid"):
-            # Extract the inner content from the full mermaid block
-            inner_content_match = re.search(r"```mermaid\n(.*?)\n```", part, re.DOTALL)
-            if inner_content_match:
-                mermaid_code = inner_content_match.group(1).strip()
-                # **THIS IS THE CRITICAL CHANGE**
-                # We generate a "code" macro and set its language to "mermaid".
-                macro = (f'<ac:structured-macro ac:name="code">'
-                         f'<ac:parameter ac:name="language">mermaid</ac:parameter>'
-                         f'<ac:plain-text-body><![CDATA[{mermaid_code}]]></ac:plain-text-body>'
-                         f'</ac:structured-macro>')
-                final_html_parts.append(macro)
+    def find_and_replace_mermaid(match):
+        block_id = len(mermaid_blocks)
+        mermaid_code = match.group(1).strip()
+        
+        # 3. CORRECTED MERMAID LOGIC: Create a 'code' macro with language 'mermaid'.
+        macro = (f'<ac:structured-macro ac:name="code">'
+                 f'<ac:parameter ac:name="language">mermaid</ac:parameter>'
+                 f'<ac:plain-text-body><![CDATA[{mermaid_code}]]></ac:plain-text-body>'
+                 f'</ac:structured-macro>')
+        mermaid_blocks[block_id] = macro
+        
+        return placeholder_template.format(block_id)
 
-        elif part.strip():
-            # This is a regular markdown part, so convert it to HTML
-            html_part = markdown.markdown(part, extensions=['fenced_code', 'tables'])
-            final_html_parts.append(html_part)
-            
-    # Join all the processed parts back together
-    final_html = "".join(final_html_parts)
+    mermaid_pattern = re.compile(r"```mermaid\n(.*?)\n```", re.DOTALL)
+    
+    # 1. Replace mermaid blocks with placeholders that markdown lib will ignore.
+    md_with_placeholders = mermaid_pattern.sub(find_and_replace_mermaid, md_content)
+    
+    # 2. Convert the rest of the markdown to HTML.
+    html_body = markdown.markdown(md_with_placeholders, extensions=['fenced_code', 'tables'])
+    
+    # 3. Replace placeholders with the real, unescaped Confluence macros.
+    final_html = html_body
+    for block_id, macro in mermaid_blocks.items():
+        final_html = final_html.replace(placeholder_template.format(block_id), macro)
+        
     return f'<div class="markdown-body">{final_html}</div>'
 
 
@@ -91,36 +93,41 @@ def find_page_in_space_by_title(title: str):
 def ensure_folder_page(folder_title: str, parent_id: str) -> str:
     """
     Ensures a Confluence page for a folder exists under the correct parent and returns its ID.
+    This function is critical for building the correct hierarchy.
     """
-    # 1. First, try to find an existing page with this title under the correct parent.
+    # 1. First, try to find an existing page with this title under the correct parent. This is the ideal case.
     try:
         cql = f'title = "{folder_title}" AND ancestor = {parent_id} AND type = page'
         res = confluence.cql(cql, limit=1, expand='content.id')
         if res and res.get('results'):
             return res['results'][0]['content']['id']
     except Exception as e:
-        print(f"  (Info) CQL query for existing folder page '{folder_title}' failed. Error: {e}")
+        print(f"  (Info) CQL query for existing folder page '{folder_title}' failed, will try other methods. Error: {e}")
 
     # 2. If not found via CQL, check if a page with this title exists anywhere else in the space.
     existing_page = find_page_in_space_by_title(folder_title)
     if existing_page:
         try:
+            # If it exists, we must check if its parent matches our target parent_id.
             ancestors = existing_page.get('ancestors') or []
             if ancestors and str(ancestors[-1].get('id')) == str(parent_id):
+                # The page exists and is already under the correct parent.
                 return existing_page['id']
             else:
-                print(f"  (Warning) Page '{folder_title}' exists but not under parent {parent_id}. Creating new page.")
+                # The page exists but is in the wrong location. To avoid data loss or moving unrelated pages,
+                # we will create a new page under the correct parent instead of moving the existing one.
+                print(f"  (Warning) Page titled '{folder_title}' exists but not under parent {parent_id}. Creating a new page to avoid moving unrelated content.")
         except Exception:
-            pass # Continue to creation
+            pass # Continue to creation if ancestor check fails
 
-    # 3. If no suitable page exists, create one.
+    # 3. If no suitable page exists, create a new one.
     try:
         print(f"  Creating folder page: '{folder_title}' under parent ID {parent_id}")
         created_page = confluence.create_page(
             space=CONFLUENCE_SPACE_KEY,
             parent_id=parent_id,
             title=folder_title,
-            body="",
+            body="",  # Folder pages have no body content
             representation="storage",
         )
         if created_page and isinstance(created_page, dict) and created_page.get('id'):
@@ -128,7 +135,8 @@ def ensure_folder_page(folder_title: str, parent_id: str) -> str:
     except Exception as e:
         print(f"  (Error) create_page API call failed for '{folder_title}': {e}")
     
-    # 4. As a final fallback, re-query to find the page we may have just created.
+    # 4. As a final fallback, re-query using CQL to find the page we may have just created.
+    # This can help in cases where the API call is slow to return the ID.
     try:
         cql = f'title = "{folder_title}" AND ancestor = {parent_id} AND type = page'
         res = confluence.cql(cql, limit=1, expand='content.id')
@@ -137,13 +145,16 @@ def ensure_folder_page(folder_title: str, parent_id: str) -> str:
     except Exception:
         pass
 
+    # If we reach this point, we have failed to create or find the page.
     raise RuntimeError(f"FATAL: Unable to ensure or locate folder page '{folder_title}' under parent {parent_id}.")
 
 
 def ensure_archive_parent() -> str:
     """
     Ensures the 'Archive' parent page exists and returns its ID.
+    Uses CONFLUENCE_ARCHIVE_PARENT_PAGE_ID if set, otherwise creates an 'Archive' page.
     """
+    # 1. Prefer the explicit environment variable if it's set and valid.
     if CONFLUENCE_ARCHIVE_PARENT_PAGE_ID:
         try:
             print(f"  Verifying archive parent ID: {CONFLUENCE_ARCHIVE_PARENT_PAGE_ID}")
@@ -151,11 +162,11 @@ def ensure_archive_parent() -> str:
             if page and page.get('id'):
                 return page['id']
         except Exception:
-            print(f"  (Warning) CONFLUENCE_ARCHIVE_PARENT_PAGE_ID ('{CONFLUENCE_ARCHIVE_PARENT_PAGE_ID}') not found. Will use default.")
+            print(f"  (Warning) CONFLUENCE_ARCHIVE_PARENT_PAGE_ID ('{CONFLUENCE_ARCHIVE_PARENT_PAGE_ID}') was not found. Will create a default archive page instead.")
 
+    # 2. If the variable is not set or invalid, create/find a default 'Archive' page under the main parent.
     print(f"  Ensuring default '{ARCHIVE_FOLDER_TITLE}' page exists under main parent {CONFLUENCE_PARENT_PAGE_ID}.")
     return ensure_folder_page(ARCHIVE_FOLDER_TITLE, CONFLUENCE_PARENT_PAGE_ID)
-
 # --- Main Execution ---
 
 def main():
@@ -164,6 +175,7 @@ def main():
     """
     # 1. --- Initial Checks & Setup ---
     print("--- 1. Verifying Configuration ---")
+    # Uses the corrected CONFLUENCE_API_TOKEN variable name
     if not all([CONFLUENCE_URL, CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACE_KEY, CONFLUENCE_PARENT_PAGE_ID]):
         print("FATAL: Missing one or more required environment variables (CONFLUENCE_URL, USERNAME, API_TOKEN, SPACE_KEY, PARENT_PAGE_ID).")
         sys.exit(1)
@@ -221,11 +233,8 @@ def main():
                 key = (parent_id, title)
 
                 local_markdown_pages[key] = {
-                    "title": title,
-                    "storage": storage_content,
-                    "hash": content_hash,
-                    "parent_id": parent_id,
-                    "filepath": filepath,
+                    "title": title, "storage": storage_content, "hash": content_hash,
+                    "parent_id": parent_id, "filepath": filepath,
                 }
     print(f"  Found {len(local_markdown_pages)} local Markdown files to process.")
 
@@ -239,9 +248,7 @@ def main():
             storage_val = page.get('body', {}).get('storage', {}).get('value', '')
             key = (parent_id, page['title'])
             all_confluence_pages[key] = {
-                "id": page['id'],
-                "hash": md5(storage_val),
-                "version": page['version']['number']
+                "id": page['id'], "hash": md5(storage_val), "version": page['version']['number']
             }
         print(f"  Found {len(all_confluence_pages)} existing pages in the space.")
     except Exception as e:
@@ -252,26 +259,30 @@ def main():
     print("\n--- 5. Determining Actions (Create, Update, Archive) ---")
     pages_to_create = []
     pages_to_update = []
-    processed_keys = set()
-
+    
     for key, local_page in local_markdown_pages.items():
-        processed_keys.add(key)
         remote_page = all_confluence_pages.get(key)
-
         if not remote_page:
             pages_to_create.append(local_page)
         elif local_page['hash'] != remote_page['hash']:
-            update_info = {**local_page, **remote_page}
-            pages_to_update.append(update_info)
+            pages_to_update.append({**local_page, **remote_page})
 
+    # 2. CORRECTED ARCHIVE LOGIC
     archive_parent_id = ensure_archive_parent()
     pages_to_archive = []
-    for key, remote_page in all_confluence_pages.items():
-        is_managed = key in local_markdown_pages
-        is_main_sync_parent = str(remote_page.get('id')) == str(CONFLUENCE_PARENT_PAGE_ID)
-        is_archive_page = str(remote_page.get('id')) == str(archive_parent_id)
+    # This set contains the IDs of all folder pages managed by this script.
+    managed_folder_ids = set(folder_parent_ids.values())
 
-        if not is_managed and not is_main_sync_parent and not is_archive_page:
+    for key, remote_page in all_confluence_pages.items():
+        remote_id_str = str(remote_page.get('id'))
+        
+        # A page should be archived ONLY if it meets all these conditions:
+        is_content_we_manage = key in local_markdown_pages
+        is_a_folder_we_manage = remote_id_str in managed_folder_ids
+        is_the_archive_folder_itself = remote_id_str == str(archive_parent_id)
+
+        # The crucial change: We DO NOT archive any page that is part of our folder structure.
+        if not is_content_we_manage and not is_a_folder_we_manage and not is_the_archive_folder_itself:
             archive_info = {**remote_page, "title": key[1], "parent_id": key[0]}
             pages_to_archive.append(archive_info)
 
