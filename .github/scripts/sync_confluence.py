@@ -164,7 +164,7 @@ def main():
     """
     # 1. --- Initial Checks & Setup ---
     print("--- 1. Verifying Configuration ---")
-    if not all([CONFLUENCE_URL, CONFLUENCE_USERNAME, CONfluence_API_TOKEN, CONFLUENCE_SPACE_KEY, CONFLUENCE_PARENT_PAGE_ID]):
+    if not all([CONFLUENCE_URL, CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACE_KEY, CONFLUENCE_PARENT_PAGE_ID]):
         print("FATAL: Missing one or more required environment variables (CONFLUENCE_URL, USERNAME, API_TOKEN, SPACE_KEY, PARENT_PAGE_ID).")
         sys.exit(1)
     print(f"  - Syncing Markdown from local folder: '{DOCS_FOLDER}'")
