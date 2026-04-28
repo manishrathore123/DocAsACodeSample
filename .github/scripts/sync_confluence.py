@@ -9,7 +9,7 @@ import markdown
 # --- Configuration from environment ---
 CONFLUENCE_URL = os.environ.get('CONFLUENCE_URL')
 CONFLUENCE_USERNAME = os.environ.get('CONFLUENCE_USERNAME')
-CONFLUENCE_API_TOKEN = os.environ.get('CONFLUENCE_API_TOKEN') # Corrected
+CONFLUENCE_API_TOKEN = os.environ.get('CONFLUENCE_API_TOKEN')
 CONFLUENCE_SPACE_KEY = os.environ.get('CONFLUENCE_SPACE_KEY')
 CONFLUENCE_PARENT_PAGE_ID = os.environ.get('CONFLUENCE_PARENT_PAGE_ID')
 CONFLUENCE_ARCHIVE_PARENT_PAGE_ID = os.environ.get('CONFLUENCE_ARCHIVE_PARENT_PAGE_ID')
@@ -22,7 +22,7 @@ try:
     confluence = Confluence(
         url=CONFLUENCE_URL,
         username=CONFLUENCE_USERNAME,
-        password=CONFLUENCE_API_TOKEN, # Uses corrected variable
+        password=CONFLUENCE_API_TOKEN,
         cloud=True,
     )
 except Exception as e:
@@ -41,43 +41,38 @@ def to_title(name: str) -> str:
 
 def markdown_to_storage(md_content: str) -> str:
     """
-    Converts Markdown to Confluence storage format using a robust placeholder method
-    to ensure Mermaid blocks are not processed by the markdown converter.
+    Converts Markdown to Confluence storage format using a robust "split and process" method.
+    This ensures the markdown converter never interferes with Mermaid blocks.
     """
-    mermaid_blocks = {}
-    # Use an HTML comment as a placeholder, which markdown parsers will ignore by design.
-    placeholder_template = "<!--MERMAID_PLACEHOLDER_{}-->"
+    # This pattern will split the text by mermaid blocks, keeping the mermaid blocks as part of the list.
+    mermaid_pattern = re.compile(r"(```mermaid\n.*?\n```)", re.DOTALL)
+    parts = mermaid_pattern.split(md_content)
     
-    def find_and_replace_mermaid(match):
-        block_id = len(mermaid_blocks)
-        mermaid_code = match.group(1).strip()
-        
-        # This is the correct macro for modern Confluence Mermaid plugins.
-        macro = (f'<ac:structured-macro ac:name="code">'
-                 f'<ac:parameter ac:name="language">mermaid</ac:parameter>'
-                 f'<ac:plain-text-body><![CDATA[{mermaid_code}]]></ac:plain-text-body>'
-                 f'</ac:structured-macro>')
-        mermaid_blocks[block_id] = macro
-        
-        # Return the placeholder that the markdown converter will ignore.
-        return placeholder_template.format(block_id)
-
-    # This regex finds all ```mermaid blocks.
-    mermaid_pattern = re.compile(r"```mermaid\n(.*?)\n```", re.DOTALL)
+    final_html_parts = []
     
-    # 1. Replace all mermaid blocks with HTML comment placeholders.
-    md_with_placeholders = mermaid_pattern.sub(find_and_replace_mermaid, md_content)
-    
-    # 2. Convert the rest of the markdown to HTML. The placeholders will pass through untouched.
-    html_body = markdown.markdown(md_with_placeholders, extensions=['fenced_code', 'tables'])
-    
-    # 3. Replace the untouched placeholders with the real, unescaped Confluence macros.
-    final_html = html_body
-    for block_id, macro in mermaid_blocks.items():
-        final_html = final_html.replace(placeholder_template.format(block_id), macro)
-        
-    # Wrap in a div for consistent styling on the Confluence page.
+    for part in parts:
+        # Check if the part is a mermaid block (it will start with ```mermaid)
+        if part.startswith("```mermaid"):
+            # Extract the inner content from the full mermaid block
+            inner_content_match = re.search(r"```mermaid\n(.*?)\n```", part, re.DOTALL)
+            if inner_content_match:
+                mermaid_code = inner_content_match.group(1).strip()
+                # Directly convert this part to the Confluence 'code' macro.
+                macro = (f'<ac:structured-macro ac:name="code">'
+                         f'<ac:parameter ac:name="language">mermaid</ac:parameter>'
+                         f'<ac:plain-text-body><![CDATA[{mermaid_code}]]></ac:plain-text-body>'
+                         f'</ac:structured-macro>')
+                final_html_parts.append(macro)
+        elif part.strip(): # Ensure the part has content before processing
+            # This is a regular markdown part, so convert it to HTML.
+            html_part = markdown.markdown(part, extensions=['fenced_code', 'tables'])
+            final_html_parts.append(html_part)
+            
+    # Join all the processed parts back together.
+    final_html = "".join(final_html_parts)
+    # The 'markdown-body' div is for styling and is optional but good practice.
     return f'<div class="markdown-body">{final_html}</div>'
+
 
 def find_page_in_space_by_title(title: str):
     """Finds a page in the Confluence space by its title."""
@@ -167,6 +162,7 @@ def ensure_archive_parent() -> str:
     # 2. If the variable is not set or invalid, create/find a default 'Archive' page under the main parent.
     print(f"  Ensuring default '{ARCHIVE_FOLDER_TITLE}' page exists under main parent {CONFLUENCE_PARENT_PAGE_ID}.")
     return ensure_folder_page(ARCHIVE_FOLDER_TITLE, CONFLUENCE_PARENT_PAGE_ID)
+
 # --- Main Execution ---
 
 def main():
@@ -175,7 +171,6 @@ def main():
     """
     # 1. --- Initial Checks & Setup ---
     print("--- 1. Verifying Configuration ---")
-    # Uses the corrected CONFLUENCE_API_TOKEN variable name
     if not all([CONFLUENCE_URL, CONFLUENCE_USERNAME, CONFLUENCE_API_TOKEN, CONFLUENCE_SPACE_KEY, CONFLUENCE_PARENT_PAGE_ID]):
         print("FATAL: Missing one or more required environment variables (CONFLUENCE_URL, USERNAME, API_TOKEN, SPACE_KEY, PARENT_PAGE_ID).")
         sys.exit(1)
@@ -270,18 +265,15 @@ def main():
     # Corrected Archive Logic
     archive_parent_id = ensure_archive_parent()
     pages_to_archive = []
-    # This set contains the IDs of all folder pages managed by this script.
     managed_folder_ids = set(folder_parent_ids.values())
 
     for key, remote_page in all_confluence_pages.items():
         remote_id_str = str(remote_page.get('id'))
         
-        # A page should be archived ONLY if it meets all these conditions:
         is_content_we_manage = key in local_markdown_pages
         is_a_folder_we_manage = remote_id_str in managed_folder_ids
         is_the_archive_folder_itself = remote_id_str == str(archive_parent_id)
 
-        # The crucial change: We DO NOT archive any page that is part of our folder structure.
         if not is_content_we_manage and not is_a_folder_we_manage and not is_the_archive_folder_itself:
             archive_info = {**remote_page, "title": key[1], "parent_id": key[0]}
             pages_to_archive.append(archive_info)
