@@ -1,7 +1,6 @@
 import os
 import sys
 import hashlib
-import re
 from datetime import datetime
 from atlassian import Confluence
 import markdown
@@ -35,34 +34,8 @@ def to_title(name: str) -> str:
     return name.replace("-", " ").replace("_", " ").strip().title()
 
 def markdown_to_storage(md_content: str) -> str:
-    """Converts Markdown content to Confluence storage format (HTML), with support for Mermaid diagrams."""
-    mermaid_pattern = re.compile(r'```mermaid\s*\r?\n(.*?)\r?\n```', re.DOTALL | re.IGNORECASE)
-
-    placeholders = {}
-    def replace_mermaid(match):
-        mermaid_code = match.group(1).strip()
-        placeholder = f"MERMAID_PLACEHOLDER_{len(placeholders)}"
-        placeholders[placeholder] = (
-            '<ac:structured-macro ac:name="mermaid"'
-            '<ac:plain-text-body><![CDATA['
-            f'{mermaid_code}'
-            ']]></ac:plain-text-body>'
-            '</ac:structured-macro>'
-        )
-        return placeholder
-
-    processed_md = mermaid_pattern.sub(replace_mermaid, md_content)
-    html = markdown.markdown(processed_md, extensions=['fenced_code'])
-
-    for placeholder, macro_html in placeholders.items():
-        html = re.sub(
-            rf'<p>\s*{re.escape(placeholder)}\s*</p>',
-            macro_html,
-            html,
-            flags=re.IGNORECASE,
-        )
-        html = html.replace(placeholder, macro_html)
-
+    """Converts Markdown content to Confluence storage format (HTML)."""
+    html = markdown.markdown(md_content)
     return f'<div class="markdown-body">{html}</div>'
 
 def find_page_in_space_by_title(title: str):
