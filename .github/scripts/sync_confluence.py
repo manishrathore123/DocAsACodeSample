@@ -53,7 +53,14 @@ def markdown_to_storage(md_content: str) -> str:
 
     processed_md = mermaid_pattern.sub(replace_mermaid, md_content)
     html = markdown.markdown(processed_md, extensions=['fenced_code'])
+
     for placeholder, macro_html in placeholders.items():
+        html = re.sub(
+            rf'<p>\s*{re.escape(placeholder)}\s*</p>',
+            macro_html,
+            html,
+            flags=re.IGNORECASE,
+        )
         html = html.replace(placeholder, macro_html)
 
     return f'<div class="markdown-body">{html}</div>'
